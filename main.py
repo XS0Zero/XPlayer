@@ -18,13 +18,14 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QButtonGroup)
 from PyQt5.QtCore import (Qt, QUrl, QTimer, QTime, QSettings, QPoint, QSize,
                           QDir, QStandardPaths, QEvent)
+from PyQt5.QtMultimedia import QMediaPlaylist
 from PyQt5.QtGui import QIcon, QKeySequence
 
-# 导入VLC播放器组件（替代QMediaPlayer）
-from vlc_player import VLCPlayer, VLCPlaylist
+# 导入Deffcode播放器组件
+from deffcode_player import DeffcodePlayer, DeffcodePlaylist
 
-# 导入自定义VLC视频显示组件
-from vlc_video_widget import VLCVideoWidget
+# 导入Deffcode视频显示组件
+from deffcode_video_widget import DeffcodeVideoWidget
 
 class XPlayer(QMainWindow):
     """主窗口类"""
@@ -56,23 +57,24 @@ class XPlayer(QMainWindow):
     
     def init_player(self):
         """初始化播放器和播放列表"""
-        # 创建VLC媒体播放器（替代QMediaPlayer）
-        self.player = VLCPlayer()
+        # 创建Deffcode媒体播放器
+        self.player = DeffcodePlayer()
         
-        # 创建VLC播放列表（替代QMediaPlaylist）
-        self.playlist = VLCPlaylist()
+        # 创建Deffcode播放列表
+        self.playlist = DeffcodePlaylist()
         self.player.setPlaylist(self.playlist)
+        self.playlist.setPlayer(self.player)
         
         # 播放历史
         self.history = []
         
         # 播放模式
         self.play_modes = {
-            "顺序播放": VLCPlaylist.Sequential,
-            "随机播放": VLCPlaylist.Random,
-            "单个播放": VLCPlaylist.CurrentItemOnce,
-            "单个循环": VLCPlaylist.CurrentItemInLoop,
-            "列表循环": VLCPlaylist.Loop
+            "顺序播放": DeffcodePlaylist.Sequential,
+            "随机播放": DeffcodePlaylist.Random,
+            "单个播放": DeffcodePlaylist.CurrentItemOnce,
+            "单个循环": DeffcodePlaylist.CurrentItemInLoop,
+            "列表循环": DeffcodePlaylist.Loop
         }
     
     def init_ui(self):
@@ -124,10 +126,12 @@ class XPlayer(QMainWindow):
     
     def setup_player_controls(self, layout):
         """设置播放器控件"""
-        # 视频显示区域（使用VLC视频组件）
-        self.video_display = VLCVideoWidget()
+        # 视频显示区域（使用Deffcode视频组件）
+        self.video_display = DeffcodeVideoWidget()
         self.video_widget = self.video_display.get_video_widget()
         self.player.setVideoOutput(self.video_widget)
+        # 连接帧更新信号
+        self.player.frameChanged.connect(self.video_display.update_frame)
         layout.addWidget(self.video_display, 1)  # 1表示拉伸因子
         
         # 进度条
@@ -396,19 +400,19 @@ class XPlayer(QMainWindow):
         play_mode = self.settings.value("play_mode", 0, int)
         if play_mode == 0:
             self.mode_sequential.setChecked(True)
-            self.playlist.setPlaybackMode(QMediaPlaylist.Sequential)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.Sequential)
         elif play_mode == 1:
             self.mode_random.setChecked(True)
-            self.playlist.setPlaybackMode(QMediaPlaylist.Random)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.Random)
         elif play_mode == 2:
             self.mode_once.setChecked(True)
-            self.playlist.setPlaybackMode(QMediaPlaylist.CurrentItemOnce)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.CurrentItemOnce)
         elif play_mode == 3:
             self.mode_repeat_one.setChecked(True)
-            self.playlist.setPlaybackMode(QMediaPlaylist.CurrentItemInLoop)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.CurrentItemInLoop)
         else:
             self.mode_repeat_all.setChecked(True)
-            self.playlist.setPlaybackMode(QMediaPlaylist.Loop)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.Loop)
         
         # 快捷键设置
         self.shortcut_play.setText(self.settings.value("shortcut_play", "Space"))
@@ -568,15 +572,15 @@ class XPlayer(QMainWindow):
         """应用播放模式"""
         mode_id = self.playmode_group.checkedId()
         if mode_id == 0:
-            self.playlist.setPlaybackMode(QMediaPlaylist.Sequential)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.Sequential)
         elif mode_id == 1:
-            self.playlist.setPlaybackMode(QMediaPlaylist.Random)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.Random)
         elif mode_id == 2:
-            self.playlist.setPlaybackMode(QMediaPlaylist.CurrentItemOnce)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.CurrentItemOnce)
         elif mode_id == 3:
-            self.playlist.setPlaybackMode(QMediaPlaylist.CurrentItemInLoop)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.CurrentItemInLoop)
         else:
-            self.playlist.setPlaybackMode(QMediaPlaylist.Loop)
+            self.playlist.setPlaybackMode(DeffcodePlaylist.Loop)
     
     def apply_shortcuts(self):
         """应用快捷键"""
@@ -646,13 +650,13 @@ class XPlayer(QMainWindow):
     def add_to_playlist(self, file_paths):
         """将文件添加到播放列表"""
         for path in file_paths:
-            # 直接使用文件路径，VLCPlaylist会处理URL转换
+            # 直接使用文件路径，QtPlaylist会处理URL转换
             self.playlist.addMedia(path)
             file_name = os.path.basename(path)
             self.playlist_widget.addItem(file_name)
         
         # 如果当前没有播放，则开始播放第一个文件
-        if self.player.state() != VLCPlayer.PlayingState:
+        if self.player.state() != DeffcodePlayer.PlayingState:
             self.playlist.setCurrentIndex(0)
             self.player.play()
             
@@ -661,7 +665,7 @@ class XPlayer(QMainWindow):
     
     def toggle_play(self):
         """切换播放/暂停状态"""
-        if self.player.state() == VLCPlayer.PlayingState:
+        if self.player.state() == DeffcodePlayer.PlayingState:
             self.player.pause()
         else:
             self.player.play()
@@ -710,7 +714,7 @@ class XPlayer(QMainWindow):
     def update_time_label(self):
         """更新时间标签"""
         position = self.player.position()
-        duration = self.player.duration()
+        duration = self.player.get_duration()
         
         position_time = QTime(0, 0)
         position_time = position_time.addMSecs(position)
@@ -729,7 +733,7 @@ class XPlayer(QMainWindow):
     
     def update_player_state(self, state):
         """更新播放器状态"""
-        if state == VLCPlayer.PlayingState:
+        if state == DeffcodePlayer.PlayingState:
             self.play_button.setText("暂停")
             # 添加到历史记录
             current_index = self.playlist.currentIndex()
