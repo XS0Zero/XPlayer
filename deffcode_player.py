@@ -66,6 +66,10 @@ class DeffcodePlayer(QObject):
         self.current_position = 0
         self.frame_rate = 0
         
+        # 帧缓冲区，用于提高跳转性能
+        self.frame_buffer_size = 5  # 缓冲5帧
+        self.frame_buffer = []
+        
         # 音频相关
         self.audio_stream = None
         self.audio_thread = None
@@ -86,6 +90,10 @@ class DeffcodePlayer(QObject):
         
         # 标记是否已经发送过时长信号
         self._duration_sent = False
+        
+        # 音视频同步相关
+        self._last_sync_time = 0  # 上次同步时间
+        self._last_seek_position = 0  # 上次跳转位置
     
     def setVideoOutput(self, video_widget):
         """
@@ -158,6 +166,21 @@ class DeffcodePlayer(QObject):
             
             # 创建帧生成器
             self.frame_generator = self.decoder.generateFrame()
+            
+            # 清空并填充帧缓冲区
+            self.frame_buffer = []
+            # 预读取几帧到缓冲区
+            for _ in range(self.frame_buffer_size):
+                try:
+                    frame = next(self.frame_generator, None)
+                    if frame is None:
+                        break
+                    self.frame_buffer.append(frame)
+                except Exception as e:
+                    print(f"初始填充帧缓冲区错误: {e}")
+                    break
+            
+            print(f"初始化解码器完成，已预加载{len(self.frame_buffer)}帧")
             
             # 获取视频信息
             metadata = self.decoder.metadata
@@ -339,8 +362,13 @@ class DeffcodePlayer(QObject):
             return
             
         try:
-            # 从生成器获取下一帧
-            frame = next(self.frame_generator, None)
+            # 检查缓冲区是否有帧
+            if self.frame_buffer:
+                # 从缓冲区获取帧
+                frame = self.frame_buffer.pop(0)
+            else:
+                # 从生成器获取下一帧
+                frame = next(self.frame_generator, None)
             
             if frame is None:
                 # 视频结束
@@ -355,9 +383,40 @@ class DeffcodePlayer(QObject):
             q_image = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888).rgbSwapped()
             self.frameChanged.emit(q_image)
             
+            # 填充帧缓冲区
+            self._fill_frame_buffer()
+            
         except Exception as e:
             print(f"更新帧错误: {e}")
             self.stop()
+            
+    def _fill_frame_buffer(self):
+        """
+        填充帧缓冲区，提高跳转性能
+        """
+        if not self.decoder or not hasattr(self, 'frame_generator') or self._state != self.PlayingState:
+            return
+            
+        # 如果缓冲区未满，尝试填充
+        # 使用更高效的填充策略，一次性获取多帧
+        frames_to_fetch = self.frame_buffer_size - len(self.frame_buffer)
+        if frames_to_fetch <= 0:
+            return
+            
+        # 限制一次性获取的帧数，避免阻塞主线程太久
+        frames_to_fetch = min(frames_to_fetch, 5)
+        
+        for _ in range(frames_to_fetch):
+            try:
+                # 尝试获取下一帧并添加到缓冲区
+                frame = next(self.frame_generator, None)
+                if frame is None:
+                    # 视频结束
+                    break
+                self.frame_buffer.append(frame)
+            except Exception as e:
+                print(f"填充帧缓冲区错误: {e}")
+                break
     
     def _update_position(self):
         """
@@ -418,6 +477,16 @@ class DeffcodePlayer(QObject):
             
             print(f"音频参数: 通道数={channels}, 采样宽度={width}, 采样率={rate}, 总帧数={frames}")
             
+            # 如果有设置seek位置，跳转到对应位置
+            if hasattr(self, 'seek_position') and self.seek_position > 0:
+                # 计算音频帧位置
+                position_frames = int((self.seek_position / 1000.0) * rate)
+                # 确保位置在有效范围内
+                if position_frames >= frames:
+                    position_frames = max(0, frames - 1)
+                wf.setpos(position_frames)
+                print(f"音频初始化时设置位置: {self.seek_position}ms (帧位置: {position_frames})")
+            
             # 创建音频流
             format = self.pyaudio_instance.get_format_from_width(width)
             self.audio_stream = self.pyaudio_instance.open(
@@ -445,6 +514,33 @@ class DeffcodePlayer(QObject):
             while self.audio_stream and self.audio_stream.is_active() and self.audio_playing and not self.audio_paused:
                 time.sleep(0.1)
                 
+                # 检查音视频同步状态（每100ms检查一次）
+                if hasattr(self, 'current_position') and self._state == self.PlayingState:
+                    # 获取当前音频位置（帧数）
+                    if hasattr(self, '_wf') and self._wf is not None:
+                        try:
+                            current_audio_pos = self._wf.tell()
+                            audio_time_ms = int((current_audio_pos / rate) * 1000)
+                            
+                            # 计算音视频差距（毫秒）
+                            sync_diff = abs(audio_time_ms - self.current_position)
+                            video_time_ms = self.current_position
+                            
+                            # 如果差距超过阈值（200ms），记录不同步情况
+                            if sync_diff > 200:
+                                print(f"检测到音视频不同步: 音频={audio_time_ms}ms, 视频={video_time_ms}ms, 差距={sync_diff}ms")
+                                
+                                # 如果差距非常大（超过1000ms），且不是刚刚进行过跳转，则尝试强制同步
+                                if sync_diff > 1000 and not hasattr(self, '_last_sync_time') or \
+                                   (time.time() - getattr(self, '_last_sync_time', 0)) > 2.0:
+                                    # 设置seek_position以触发音频回调中的同步
+                                    self.seek_position = video_time_ms
+                                    # 记录最后同步时间，避免频繁同步
+                                    self._last_sync_time = time.time()
+                                    print(f"触发强制音视频同步: 设置seek_position={video_time_ms}ms")
+                        except Exception as e:
+                            print(f"检查音视频同步错误: {e}")
+                
             print("音频播放结束或被中断")
                 
             # 停止并关闭流
@@ -469,6 +565,7 @@ class DeffcodePlayer(QObject):
         音频回调函数
         """
         try:
+            # 检查是否需要重新打开音频文件或重新定位
             if not hasattr(self, '_wf') or self._wf is None:
                 self._wf = wave.open(self.audio_file, 'rb')
                 print(f"打开音频文件: {self.audio_file}")
@@ -478,9 +575,71 @@ class DeffcodePlayer(QObject):
                     # 计算音频帧位置
                     frame_rate = self._wf.getframerate()
                     position_frames = int((self.seek_position / 1000.0) * frame_rate)
+                    # 确保位置在有效范围内
+                    if position_frames >= self._wf.getnframes():
+                        position_frames = max(0, self._wf.getnframes() - 1)
                     self._wf.setpos(position_frames)
-                    print(f"位置已设置到: {self.seek_position}ms")
+                    print(f"音频位置已设置到: {self.seek_position}ms (帧位置: {position_frames})")
+                    # 记录最后一次设置的位置，用于后续同步检查
+                    self._last_seek_position = self.seek_position
+                    # 重置seek_position，避免重复跳转
+                    self.seek_position = 0
+            
+            # 检查是否需要重新定位（当前播放位置与seek_position不匹配）
+            elif hasattr(self, 'seek_position') and self.seek_position > 0:
+                # 获取当前音频位置（帧数）
+                current_audio_pos = self._wf.tell()
+                frame_rate = self._wf.getframerate()
                 
+                # 计算期望的音频帧位置
+                expected_pos = int((self.seek_position / 1000.0) * frame_rate)
+                # 确保位置在有效范围内
+                if expected_pos >= self._wf.getnframes():
+                    expected_pos = max(0, self._wf.getnframes() - 1)
+                
+                # 如果当前位置与期望位置相差太大，重新定位
+                # 允许一定的误差范围（约50ms的帧数）
+                tolerance = int(0.05 * frame_rate)  # 降低容差以提高精度
+                if abs(current_audio_pos - expected_pos) > tolerance:
+                    print(f"音频位置同步: 当前={current_audio_pos}, 期望={expected_pos}, 差距={(current_audio_pos - expected_pos) / frame_rate * 1000:.2f}ms")
+                    self._wf.setpos(expected_pos)
+                    # 记录最后一次设置的位置，用于后续同步检查
+                    self._last_seek_position = self.seek_position
+                    # 重置seek_position，避免重复跳转
+                    self.seek_position = 0
+                    # 清空缓冲区中的旧数据
+                    return (b'', pyaudio.paContinue)
+                else:
+                    # 位置已经足够接近，只需重置seek_position
+                    self._last_seek_position = self.seek_position
+                    self.seek_position = 0
+            
+            # 持续监控音视频同步状态
+            elif hasattr(self, 'current_position') and self._state == self.PlayingState:
+                # 获取当前音频位置（帧数）和视频位置
+                current_audio_pos = self._wf.tell()
+                frame_rate = self._wf.getframerate()
+                audio_time_ms = int((current_audio_pos / frame_rate) * 1000)
+                video_time_ms = self.current_position
+                
+                # 计算音视频差距（毫秒）
+                sync_diff = abs(audio_time_ms - video_time_ms)
+                
+                # 如果差距超过阈值（300ms），尝试同步
+                if sync_diff > 300:
+                    print(f"检测到音视频严重不同步: 音频={audio_time_ms}ms, 视频={video_time_ms}ms, 差距={sync_diff}ms")
+                    # 计算新的音频位置
+                    new_pos = int((video_time_ms / 1000.0) * frame_rate)
+                    # 确保位置在有效范围内
+                    if new_pos >= self._wf.getnframes():
+                        new_pos = max(0, self._wf.getnframes() - 1)
+                    # 设置新位置
+                    self._wf.setpos(new_pos)
+                    print(f"自动调整音频位置到: {video_time_ms}ms (帧位置: {new_pos})")
+                    # 清空缓冲区中的旧数据
+                    return (b'', pyaudio.paContinue)
+                
+            # 读取音频帧
             data = self._wf.readframes(frame_count)
             
             # 检查是否到达文件末尾
@@ -490,7 +649,9 @@ class DeffcodePlayer(QObject):
                 if hasattr(self, '_wf') and self._wf is not None:
                     self._wf.close()
                     self._wf = None
-                return (b'', pyaudio.paComplete)
+                # 返回继续状态而不是完成状态，这样可以防止音频流在文件结束时立即关闭
+                # 特别是在跳转位置时，可能会暂时没有数据，但不应该结束播放
+                return (b'', pyaudio.paContinue)
             
             # 应用音量控制
             if data and self._volume < 100:
@@ -511,34 +672,56 @@ class DeffcodePlayer(QObject):
                 except:
                     pass
                 self._wf = None
-            return (b'', pyaudio.paComplete)
+            # 返回继续状态而不是完成状态，这样可以防止音频流在出错时立即关闭
+            # 这样在跳转位置时，即使出现临时错误，音频流也不会被关闭
+            return (b'', pyaudio.paContinue)
     
     def _stop_audio(self):
         """
         停止音频播放
         """
+        # 标记音频播放状态为停止
         self.audio_playing = False
+        
+        # 检查是否是因为跳转位置而调用此方法
+        is_seeking = hasattr(self, 'seek_position') and self.seek_position > 0
         
         if self.audio_stream:
             try:
+                # 停止音频流
                 self.audio_stream.stop_stream()
-                self.audio_stream.close()
+                
+                # 只有在非跳转情况下才完全关闭音频流
+                # 在跳转位置时，我们希望保持音频流打开以便从新位置继续播放
+                if not is_seeking:
+                    self.audio_stream.close()
+                    self.audio_stream = None
+                else:
+                    # 在跳转位置时，只标记为暂停而不关闭
+                    self.audio_paused = True
             except Exception as e:
                 print(f"停止音频流错误: {e}")
-            finally:
-                self.audio_stream = None
+                # 出错时完全关闭
+                if self.audio_stream:
+                    try:
+                        self.audio_stream.close()
+                    except:
+                        pass
+                    self.audio_stream = None
         
         # 关闭音频文件
-        if hasattr(self, '_wf') and self._wf is not None:
+        # 在跳转位置时，我们希望在音频回调中重新打开文件，而不是在这里关闭
+        if not is_seeking and hasattr(self, '_wf') and self._wf is not None:
             try:
                 self._wf.close()
                 print("关闭音频文件")
+                self._wf = None
             except Exception as e:
                 print(f"关闭音频文件错误: {e}")
-            finally:
                 self._wf = None
                 
-        if self.audio_thread and self.audio_thread.is_alive():
+        # 只在非跳转情况下等待音频线程结束
+        if not is_seeking and self.audio_thread and self.audio_thread.is_alive():
             self.audio_thread.join(1)  # 等待最多1秒
     
     def play(self):
@@ -656,42 +839,145 @@ class DeffcodePlayer(QObject):
         target_time = position / 1000.0
         print(f"目标时间位置: {target_time}秒")
         
-        # 停止当前播放但不重置位置
-        if self.audio_stream:
-            self._stop_audio()
+        # 暂停当前播放但不重置位置
         if self.timer.isActive():
             self.timer.stop()
         if self.position_timer.isActive():
             self.position_timer.stop()
         
-        # 设置seek位置，供_init_decoder使用
-        self.seek_position = position
-        
         try:
-            # 重新初始化解码器
-            if self._init_decoder():
-                # 确保位置正确设置
-                self.current_position = position
-                self.positionChanged.emit(self.current_position)
+            # 设置当前位置和seek位置，供音频播放使用
+            self.current_position = position
+            self.seek_position = position
+            self.positionChanged.emit(self.current_position)
+            
+            # 优化的跳转方法：使用预缓冲和快速seek
+            if self.decoder and hasattr(self.decoder, 'frame_generator'):
+                # 暂停音频但不完全停止，以便在新位置继续播放
+                audio_was_active = False
+                if self.audio_stream and self.audio_stream.is_active():
+                    audio_was_active = True
+                    self.audio_stream.stop_stream()
+                    self.audio_paused = True
                 
-                # 如果之前是播放状态，继续播放
-                if was_playing:
-                    # 设置状态为播放
-                    self._state = self.PlayingState
-                    self.stateChanged.emit(self._state)
+                # 使用快速seek方法
+                seek_seconds = position / 1000.0
+                
+                # 保存当前解码器的参数
+                current_format = self.decoder.frame_format if hasattr(self.decoder, 'frame_format') else "bgr24"
+                
+                # 尝试使用更高效的seek方法
+                try:
+                    # 关闭当前解码器但不完全释放资源
+                    if hasattr(self.decoder, 'close'):
+                        self.decoder.close()
                     
-                    # 启动定时器
-                    self.timer.start()
-                    self.position_timer.start()
+                    # 使用相同的参数但添加seek参数创建新的解码器
+                    # 增加缓冲区大小以提高跳转后的流畅度
+                    self.decoder = FFdecoder(
+                        self.media_path, 
+                        frame_format=current_format,
+                        **{
+                            '-ss': str(seek_seconds),  # 使用FFmpeg的seek参数
+                            '-analyzeduration': '10000000',  # 增加分析时间
+                            '-probesize': '10000000'  # 增加探测大小
+                        }
+                    ).formulate()
                     
-                    # 启动音频播放
-                    if self.audio_file and os.path.exists(self.audio_file):
-                        # 开始新的音频播放
-                        self.audio_thread = threading.Thread(target=self._play_audio)
-                        self.audio_thread.daemon = True
-                        self.audio_thread.start()
+                    # 创建新的帧生成器
+                    self.frame_generator = self.decoder.generateFrame()
                     
-                print(f"位置已设置到: {self.current_position}ms")
+                    # 清空并预加载更多帧到缓冲区以提高响应速度
+                    self.frame_buffer = []
+                    
+                    # 增加缓冲区大小以提高跳转后的流畅度
+                    temp_buffer_size = self.frame_buffer_size * 2
+                    
+                    # 预读取更多帧到缓冲区
+                    for _ in range(temp_buffer_size):
+                        try:
+                            frame = next(self.frame_generator, None)
+                            if frame is None:
+                                break
+                            self.frame_buffer.append(frame)
+                        except Exception as e:
+                            print(f"填充帧缓冲区错误: {e}")
+                            break
+                    
+                    print(f"成功使用快速seek跳转到: {position}ms，已预加载{len(self.frame_buffer)}帧")
+                    
+                    # 如果之前是播放状态，继续播放
+                    if was_playing:
+                        # 设置状态为播放
+                        self._state = self.PlayingState
+                        self.stateChanged.emit(self._state)
+                        
+                        # 启动定时器
+                        self.timer.start()
+                        self.position_timer.start()
+                        
+                        # 继续音频播放（从新位置开始）
+                        if self.audio_file and os.path.exists(self.audio_file):
+                            if audio_was_active and self.audio_stream and self.audio_paused:
+                                # 如果音频流存在且已暂停，直接从新位置继续播放
+                                self.audio_paused = False
+                                self.audio_stream.start_stream()
+                            else:
+                                # 否则创建新的音频播放线程
+                                # 注意：不要在这里调用_stop_audio()，因为它会完全关闭音频流
+                                # 只有在必要时才创建新的音频线程
+                                if not self.audio_thread or not self.audio_thread.is_alive():
+                                    self.audio_thread = threading.Thread(target=self._play_audio)
+                                    self.audio_thread.daemon = True
+                                    self.audio_thread.start()
+                except Exception as e:
+                    print(f"快速seek失败，回退到重新初始化解码器: {e}")
+                    # 如果快速seek失败，回退到完全重新初始化解码器
+                    # 保存音频状态，避免在_init_decoder中被完全停止
+                    audio_was_playing = self.audio_playing
+                    audio_was_paused = self.audio_paused
+                    
+                    if not self._init_decoder():
+                        raise Exception("重新初始化解码器失败")
+                    
+                    # 如果之前是播放状态，继续播放
+                    if was_playing:
+                        # 设置状态为播放
+                        self._state = self.PlayingState
+                        self.stateChanged.emit(self._state)
+                        
+                        # 启动定时器
+                        self.timer.start()
+                        self.position_timer.start()
+                        
+                        # 确保音频播放被重新启动
+                        if self.audio_file and os.path.exists(self.audio_file):
+                            # 始终创建新的音频播放线程，因为_init_decoder已经停止了之前的音频
+                            self.audio_thread = threading.Thread(target=self._play_audio)
+                            self.audio_thread.daemon = True
+                            self.audio_thread.start()
+            else:
+                # 如果解码器不可用或没有帧生成器，回退到完全重新初始化
+                print("解码器不可用，使用完全重新初始化方法")
+                if self._init_decoder():
+                    # 如果之前是播放状态，继续播放
+                    if was_playing:
+                        # 设置状态为播放
+                        self._state = self.PlayingState
+                        self.stateChanged.emit(self._state)
+                        
+                        # 启动定时器
+                        self.timer.start()
+                        self.position_timer.start()
+                        
+                        # 启动音频播放
+                        if self.audio_file and os.path.exists(self.audio_file):
+                            # 始终创建新的音频播放线程
+                            self.audio_thread = threading.Thread(target=self._play_audio)
+                            self.audio_thread.daemon = True
+                            self.audio_thread.start()
+                
+            print(f"位置已设置到: {self.current_position}ms")
         except Exception as e:
             print(f"设置位置错误: {e}")
             import traceback
