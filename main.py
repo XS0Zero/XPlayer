@@ -353,7 +353,7 @@ class XPlayer(QMainWindow):
         self.volume_slider.valueChanged.connect(self.player.setVolume)
         
         # 进度控制
-        self.progress_slider.sliderMoved.connect(self.set_position)
+        self.progress_slider.sliderReleased.connect(self.slider_released)
         self.player.durationChanged.connect(self.update_duration)
         self.player.positionChanged.connect(self.update_position)
         
@@ -699,6 +699,12 @@ class XPlayer(QMainWindow):
     def set_position(self, position):
         """设置播放位置"""
         self.player.setPosition(position)
+        
+    def slider_released(self):
+        """进度条释放事件处理"""
+        # 只有在用户松开进度条后才更新位置
+        position = self.progress_slider.value()
+        self.player.setPosition(position)
     
     def update_duration(self, duration):
         """更新总时长"""
@@ -803,9 +809,7 @@ class XPlayer(QMainWindow):
     def show_about(self):
         """显示关于对话框"""
         QMessageBox.about(self, "关于 XPlayer", 
-                          "XPlayer 是一个基于 Python 和 PyQt5 开发的多媒体播放器，\n"
-                          "支持常见音视频格式播放、音量调节、进度控制、倍速播放、\n"
-                          "播放列表管理、主题切换、播放模式设置和快捷键配置。")
+                          "作者:XS")
 
 
 if __name__ == "__main__":
