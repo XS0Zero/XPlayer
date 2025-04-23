@@ -718,24 +718,14 @@ class XPlayer(QMainWindow):
         self.update_time_label()
     
     def update_time_label(self):
-        """更新时间标签"""
-        position = self.player.position()
-        duration = self.player.get_duration()
+        position = self.player.current_position
+        duration = self.player.duration
         
-        position_time = QTime(0, 0)
-        position_time = position_time.addMSecs(position)
+        # Convert position to int before passing to addMSecs
+        position_time = QTime(0, 0, 0).addMSecs(int(position))
+        duration_time = QTime(0, 0, 0).addMSecs(duration)
         
-        duration_time = QTime(0, 0)
-        duration_time = duration_time.addMSecs(duration)
-        
-        time_format = "mm:ss"
-        if duration >= 3600000:  # 如果时长超过1小时
-            time_format = "hh:mm:ss"
-        
-        position_str = position_time.toString(time_format)
-        duration_str = duration_time.toString(time_format)
-        
-        self.time_label.setText(f"{position_str} / {duration_str}")
+        self.time_label.setText(f"{position_time.toString('mm:ss')} / {duration_time.toString('mm:ss')}")
     
     def update_player_state(self, state):
         """更新播放器状态"""
